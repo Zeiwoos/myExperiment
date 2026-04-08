@@ -1,5 +1,7 @@
 from collections import OrderedDict
 from typing import Tuple, Union
+from .light_adapter import LightweightBottleneckAdapter
+import math
 
 import numpy as np
 import torch
@@ -100,7 +102,6 @@ class AttentionPool2d(nn.Module):
             need_weights=False
         )
 
-    
         return x.transpose(0, 1)
 
 
@@ -196,23 +197,44 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = attn_mask
         self.need_weights = need_weights
 
+        # ============== 【轻量级 Adapter 挂载点】 ==============
+        self.use_adapter = False  # 默认关闭，稍后在外部针对视觉分支开启
+        self.adapter = LightweightBottleneckAdapter(d_model=d_model, bottleneck_dim=64)
+
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        if self.need_weights == False:
-            return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
-        else:
-            return self.attn(x, x, x, need_weights=True, attn_mask=self.attn_mask)
+        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
     def forward(self, x: torch.Tensor):
-        if self.need_weights == False:
-            x = x + self.attention(self.ln_1(x))
-            x = x + self.mlp(self.ln_2(x))
-            return x
+        x = x + self.attention(self.ln_1(x))
+
+        # ============== 【核心改造：MLP 并联 Adapter】 ==============
+        norm_x = self.ln_2(x)
+        mlp_out = self.mlp(norm_x)  # 原始冻结的特征加工
+
+        if hasattr(self, 'use_adapter') and self.use_adapter:
+            # CLIP 内部张量形状是 (L, N, D) = (序列长, 批次, 维度)
+            # 我们的 Adapter 期望输入 (N, L, D)，所以要做维度转换
+            norm_x_batch_first = norm_x.permute(1, 0, 2)
+
+            # 动态推导图像的长宽 (H, W)，供 DW-Conv 卷积使用 (L = H*W + 1个CLS_token)
+            L = norm_x.shape[0]
+            hw_shape = None
+            if L > 1:
+                hw = int(math.sqrt(L - 1))
+                if hw * hw == L - 1:  # 严格确保是视觉 Patch 序列
+                    hw_shape = (hw, hw)
+
+            # 提取 Adapter 的细微调整特征 (注意保持 fp16/fp32 数据类型对齐)
+            adapter_out = self.adapter(norm_x_batch_first.to(self.adapter.down_proj.weight.dtype), hw_shape=hw_shape)
+            adapter_out = adapter_out.to(x.dtype).permute(1, 0, 2)
+
+            # 特征融合：主干(x) + 原MLP(mlp_out) + 微调旋钮(adapter_out)
+            x = x + mlp_out + adapter_out
         else:
-            y, attn = self.attention(self.ln_1(x))
-            x = x + y
-            x = x + self.mlp(self.ln_2(x))
-            return x
+            x = x + mlp_out
+
+        return x
 
 
 class Transformer(nn.Module):
@@ -220,14 +242,16 @@ class Transformer(nn.Module):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask, need_weights if i == layers - 1 else False) for i in range(layers)])
+        self.resblocks = nn.Sequential(*[
+            ResidualAttentionBlock(width, heads, attn_mask, need_weights if i == layers - 1 else False)
+            for i in range(layers)
+        ])
 
     def forward(self, x: torch.Tensor):
         return self.resblocks(x)
 
     def get_cast_dtype(self) -> torch.dtype:
         return self.resblocks[0].mlp.c_fc.weight.dtype
-
 
 
 class VisionTransformer(nn.Module):
@@ -251,7 +275,9 @@ class VisionTransformer(nn.Module):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        x = torch.cat(
+            [self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+             x], dim=1)  # shape = [*, grid ** 2 + 1, width]
 
         #####################################################################################
         side = int((self.positional_embedding.shape[0] - 1) ** 0.5)
@@ -265,7 +291,6 @@ class VisionTransformer(nn.Module):
             self.positional_embedding.data = torch.cat([self.positional_embedding[:1, :], new_pos[0]], 0)
         #####################################################################################
 
-
         x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
 
@@ -273,7 +298,7 @@ class VisionTransformer(nn.Module):
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
-        #x = self.ln_post(x[:, 0, :])
+        # x = self.ln_post(x[:, 0, :])
         x = self.ln_post(x)  # return both cls token and image tokens
 
         if self.proj is not None:
@@ -397,7 +422,7 @@ class CLIP(nn.Module):
 
         return x
 
-    def encode_text_learn(self, prompts, tokenized_prompts, deep_compound_prompts_text = None, normalize: bool = False):
+    def encode_text_learn(self, prompts, tokenized_prompts, deep_compound_prompts_text=None, normalize: bool = False):
         cast_dtype = self.transformer.get_cast_dtype()
 
         # x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
@@ -416,8 +441,6 @@ class CLIP(nn.Module):
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
         return x
-
-
 
     def forward(self, image, text):
         image_features = self.encode_image(image)
