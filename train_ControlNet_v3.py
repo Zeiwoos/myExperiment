@@ -1,29 +1,21 @@
 import argparse
 import os
 import random
+import copy  # 用于复制教师模型
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from einops import rearrange
 from tqdm import tqdm
 
 import adapterlib
-from adapterlib import (BinaryDiceLoss, ControlNet, FocalLoss, PQAdapter,
+# 移除了 ControlNet，保留其他必要的模块
+from adapterlib import (BinaryDiceLoss, FocalLoss, PQAdapter,
                         TextualAdapter, VisualAdapter)
 from dataset import Dataset, PromptDataset
 from tools import get_logger, get_transform, normalize, setup_seed
-
-
-def prepare_control_hint(hint, hint_channels):
-    if hint_channels == 1 and hint.shape[1] != 1:
-        hint = hint.mean(dim=1, keepdim=True)
-    elif hint_channels == 3 and hint.shape[1] == 1:
-        hint = hint.repeat(1, 3, 1, 1)
-    elif hint.shape[1] != hint_channels:
-        repeat_count = (hint_channels + hint.shape[1] - 1) // hint.shape[1]
-        hint = hint.repeat(1, repeat_count, 1, 1)[:, :hint_channels, :, :]
-    return hint
 
 
 def train(args):
@@ -37,13 +29,6 @@ def train(args):
     vl_reduction = args.vl_reduction
     pq_mid_dim = args.pq_mid_dim
     pq_context = args.pq_context
-    control_enabled = args.enable_controlnet
-    controlnet_only = args.controlnet_only
-
-    if control_enabled and not args.visual_learner:
-        raise ValueError("ControlNet is only consumed by visual_learner. Please set --visual_learner.")
-    if controlnet_only and not args.visual_learner:
-        raise ValueError("controlnet_only requires --visual_learner because loss must flow through VisualAdapter.")
 
     mode = 'train'
 
@@ -62,95 +47,114 @@ def train(args):
         patch_size = 14
         input_dim = 768
         model.visual.DAPM_replace(DPAM_layer=DPAM_layer)
-    if args.pretrained_model == 'VITB16_PLUS_240':
+    elif args.pretrained_model == 'VITB16_PLUS_240':
         model, _ = adapterlib.load(args.pretrained_model, device=device)
         DPAM_layer = 10
         patch_size = 16
         input_dim = 640
         model.visual.DAPM_replace(DPAM_layer=DPAM_layer)
-
-    if args.pretrained_model == 'ViT-L-14-CLIPA-336':
+    elif args.pretrained_model == 'ViT-L-14-CLIPA-336':
         model, _ = adapterlib.load(args.pretrained_model, device=device)
         DPAM_layer = 20
         patch_size = 14
         input_dim = 768
         model.visual.DAPM_replace(DPAM_layer=DPAM_layer)
+    else:
+        raise ValueError(f"Unsupported pretrained_model: {args.pretrained_model}")
+
+    # ====================== 关键新增 1：准备教师模型 ======================
+    # 在给学生模型插入/激活 Adapter 之前，复制一份纯净的教师模型并完全冻结
+    teacher_model = copy.deepcopy(model)
+    teacher_model.eval()
+    for param in teacher_model.parameters():
+        param.requires_grad = False
+
+    # ====================== 关键新增 2：激活内部轻量级 Adapter ======================
+    # 冻结基座 CLIP 的所有原生参数
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # 仅激活视觉分支最后 6 层的内部并联 Adapter
+    visual_transformer = model.visual.transformer
+    num_layers = len(visual_transformer.resblocks)
+    adapter_layers = 6
+    for i in range(num_layers - adapter_layers, num_layers):
+        block = visual_transformer.resblocks[i]
+        block.use_adapter = True  # 开启我们在 clip.py 里加的开关
+        for param in block.adapter.parameters():
+            param.requires_grad = True  # 赋予梯度
 
     # ====================== Init Adapters ======================
     textual_learner = TextualAdapter(model.to("cpu"), img_size, args.n_ctx)
     visual_learner = VisualAdapter(img_size, patch_size, input_dim=input_dim, reduction=vl_reduction)
     pq_learner = PQAdapter(img_size, patch_size, context=pq_context, input_dim=input_dim, mid_dim=pq_mid_dim,
                            layers_num=len(features_list))
-    controlnet = None
-    if control_enabled:
-        controlnet = ControlNet(
-            hint_channels=args.control_hint_channels,
-            model_channels=input_dim,
-            layers_num=len(features_list),
-            control_scales=args.control_scales,
-        )
-    elif controlnet_only:
-        raise ValueError("controlnet_only requires --enable_controlnet")
 
     model.to(device)
+    teacher_model.to(device)
     textual_learner.to(device)
     visual_learner.to(device)
     pq_learner.to(device)
-    if controlnet is not None:
-        controlnet.to(device)
 
-    model.eval()
+    model.train()  # 注意：学生模型基座由于包含可训练的 Adapter，需开启 train 模式
     textual_learner.train()
     visual_learner.train()
     pq_learner.train()
-    if controlnet is not None:
-        controlnet.train()
+
+    # BatchNorm 在 batch_size=1 且处于 train 模式时会直接报错。
+    # 这里选择将 BN 层置为 eval，仅避免崩溃；BN 的 affine 参数仍可参与训练。
+    if batch_size == 1:
+        for m in visual_learner.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                m.eval()
 
     if args.checkpoint_path:
         logger.info('\n' + "loading checkpoint from: " + args.checkpoint_path)
         checkpoint_adapter = torch.load(args.checkpoint_path, map_location=device)
         if "textual_learner" in checkpoint_adapter:
-            textual_learner.load_state_dict(checkpoint_adapter["textual_learner"])
+            textual_learner.load_state_dict(checkpoint_adapter["textual_learner"], strict=False)
         if "visual_learner" in checkpoint_adapter:
-            visual_learner.load_state_dict(checkpoint_adapter["visual_learner"])
+            visual_learner.load_state_dict(checkpoint_adapter["visual_learner"], strict=False)
         if "pq_learner" in checkpoint_adapter:
-            pq_learner.load_state_dict(checkpoint_adapter["pq_learner"])
-        if controlnet is not None and "controlnet" in checkpoint_adapter:
-            controlnet.load_state_dict(checkpoint_adapter["controlnet"])
+            pq_learner.load_state_dict(checkpoint_adapter["pq_learner"], strict=False)
+        if "internal_adapters" in checkpoint_adapter:
+            # 加载内部 Adapter 权重
+            model.load_state_dict(checkpoint_adapter["internal_adapters"], strict=False)
 
-    if controlnet_only:
-        for module in (textual_learner, visual_learner, pq_learner):
-            module.eval()
-            for param in module.parameters():
-                param.requires_grad = False
-        if controlnet is not None:
-            controlnet.train()
+    textual_learner_parameters = sum(p.numel() for p in textual_learner.parameters() if p.requires_grad)
+    visual_learner_parameters = sum(p.numel() for p in visual_learner.parameters() if p.requires_grad)
+    pq_learner_parameters = sum(p.numel() for p in pq_learner.parameters() if p.requires_grad)
+    internal_adapter_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    textual_learner_parameters = sum(p.numel() for p in textual_learner.parameters())
-    visual_learner_parameters = sum(p.numel() for p in visual_learner.parameters())
-    pq_learner_parameters = sum(p.numel() for p in pq_learner.parameters())
-    controlnet_parameters = sum(p.numel() for p in controlnet.parameters()) if controlnet is not None else 0
-
-    learned_parameters = textual_learner_parameters + visual_learner_parameters + pq_learner_parameters + controlnet_parameters
-    fixed_parameters = sum(p.numel() for p in model.parameters())
+    learned_parameters = textual_learner_parameters + visual_learner_parameters + pq_learner_parameters + internal_adapter_parameters
+    fixed_parameters = sum(p.numel() for p in model.parameters() if not p.requires_grad)
 
     print(f"textual_learner params:{(textual_learner_parameters):.0f}",
           f"visual_learner params:{(visual_learner_parameters) / 1e+6:.1f}M",
           f"pq_learner params:{(pq_learner_parameters) / 1e+6:.1f}M",
-          f"controlnet params:{(controlnet_parameters) / 1e+6:.1f}M",
+          f"internal_adapter params:{(internal_adapter_parameters) / 1e+6:.1f}M",
           f"learned all parameters:{(learned_parameters) / 1e+6:.1f}M",
           f"fixed params:{(fixed_parameters) / 1e+6:.1f}M",
           f"all params:{(learned_parameters + fixed_parameters) / 1e+6:.1f}M"
           )
 
     # ====================== Optimizer and Loss  ======================
-    if controlnet_only:
-        optimizer_params = list(controlnet.parameters()) if controlnet is not None else []
-    else:
-        optimizer_params = list(textual_learner.parameters()) + list(visual_learner.parameters()) + list(
-            pq_learner.parameters())
-        if controlnet is not None:
-            optimizer_params += list(controlnet.parameters())
+    # 将内部的轻量级 Adapter 参数也加入优化器
+    optimizer_params = list(textual_learner.parameters()) + list(visual_learner.parameters()) + list(
+        pq_learner.parameters())
+    optimizer_params += [p for p in model.parameters() if p.requires_grad]
+
+    # 避免重复参数导致 optimizer 警告/未来版本报错
+    seen_param_ids = set()
+    optimizer_params_uniq = []
+    for p in optimizer_params:
+        pid = id(p)
+        if pid in seen_param_ids:
+            continue
+        seen_param_ids.add(pid)
+        optimizer_params_uniq.append(p)
+    optimizer_params = optimizer_params_uniq
+
     optimizer = torch.optim.Adam(
         optimizer_params,
         lr=args.learning_rate,
@@ -172,6 +176,7 @@ def train(args):
     for epoch in tqdm(range(args.epoch)):
         local_loss_list = []
         global_loss_list = []
+        kd_loss_list = []
 
         for items in tqdm(train_data_loader):
             prompt_image = items['prompt_img'].to(device)  # B*s*c*h*w
@@ -182,37 +187,39 @@ def train(args):
             label = items['anomaly']
 
             gt = items['img_mask'].squeeze().to(device)
+            if gt.dim() == 2:
+                gt = gt.unsqueeze(0)  # 修复batch为1时降维错误
             gt[gt > 0.5] = 1
             gt[gt <= 0.5] = 0
 
+            # ====================== 关键修改 3：特征提取逻辑分离 ======================
+            # 1. 教师模型提取纯净特征 (不计算梯度)
             with torch.no_grad():
-                query_feats, query_patch_feats = model.encode_image(image, args.features_list, DPAM_layer=DPAM_layer)
-                prompt_feats, prompt_patch_feats = model.encode_image(prompt_image, args.features_list,
-                                                                      DPAM_layer=DPAM_layer)
+                teacher_query_feats, teacher_query_patch_feats = teacher_model.encode_image(image, args.features_list,
+                                                                                            DPAM_layer=DPAM_layer)
+                prompt_feats, prompt_patch_feats = teacher_model.encode_image(prompt_image, args.features_list,
+                                                                              DPAM_layer=DPAM_layer)
 
                 prompt_feats = prompt_feats.reshape(b, s, -1)
                 for idx in range(len(args.features_list)):
                     prompt_patch_feats[idx] = rearrange(prompt_patch_feats[idx], '(b s) l d -> b s l d', b=b, s=s)
 
+            # 2. 学生模型提取特征 (必须有梯度，因为内部有可训练的 Adapter)
+            query_feats, query_patch_feats = model.encode_image(image, args.features_list, DPAM_layer=DPAM_layer)
+
+            # 3. 计算特征蒸馏 Loss (KD Loss)
+            loss_kd = 0
+            for t_feat, s_feat in zip(teacher_query_patch_feats, query_patch_feats):
+                loss_kd += F.mse_loss(s_feat, t_feat)
+
             local_loss = 0
             global_loss = 0
+
             # ====================== visual_adapter ======================
             if args.visual_learner:
                 static_text_features = textual_learner.static_text_features
-                control_features = None
-                if controlnet is not None:
-                    if args.control_hint_source == "gt":
-                        hint = gt
-                        if hint.dim() == 2:
-                            hint = hint.unsqueeze(0)
-                        if hint.dim() == 3:
-                            hint = hint.unsqueeze(1)
-                    else:
-                        hint = image
-                    hint = prepare_control_hint(hint, args.control_hint_channels)
-                    control_features = controlnet(query_patch_feats, hint)
-                global_logit, local_score = visual_learner(query_feats, query_patch_feats, static_text_features,
-                                                           control=control_features)
+                # 移除了 ControlNet 后，直接将原特征送入 VisualAdapter
+                global_logit, local_score = visual_learner(query_feats, query_patch_feats, static_text_features)
 
                 global_loss += F.cross_entropy(global_logit, label.long().to(device))
 
@@ -247,28 +254,38 @@ def train(args):
                     local_loss += loss_dice(local_score_list[i][:, 0, :, :], 1 - gt)
 
             optimizer.zero_grad()
-            (local_loss + global_loss).backward()
+
+            # ====================== 关键修改 4：融合蒸馏 Loss ======================
+            total_loss = local_loss + global_loss + args.lambda_kd * loss_kd
+            total_loss.backward()
+
             optimizer.step()
-            global_loss_list.append(global_loss.item())
-            local_loss_list.append(local_loss.item())
+
+            global_loss_list.append(global_loss.item() if isinstance(global_loss, torch.Tensor) else 0)
+            local_loss_list.append(local_loss.item() if isinstance(local_loss, torch.Tensor) else 0)
+            kd_loss_list.append(loss_kd.item())
 
         # logs
         if (epoch + 1) % args.print_freq == 0:
-            logger.info('epoch [{}/{}], global_loss:{:.4f}, local_loss:{:.4f}'.format(epoch + 1, args.epoch,
-                                                                                      np.mean(global_loss_list),
-                                                                                      np.mean(local_loss_list)))
+            logger.info('epoch [{}/{}], global_loss:{:.4f}, local_loss:{:.4f}, kd_loss:{:.4f}'.format(
+                epoch + 1, args.epoch, np.mean(global_loss_list), np.mean(local_loss_list), np.mean(kd_loss_list)))
 
         # save model
         if (epoch + 1) % args.save_freq == 0:
             ckp_path = os.path.join(args.save_path, 'epoch_' + str(epoch + 1) + '.pth')
 
+            # 只保存基座里“可训练参数”的 state_dict 条目（内部 Adapter）
+            trainable_param_names = {name for name, p in model.named_parameters() if p.requires_grad}
+            model_sd = model.state_dict()
+            internal_adapters_sd = {k: v for k, v in model_sd.items() if k in trainable_param_names}
+
             save_state = {
                 "textual_learner": textual_learner.state_dict(),
                 "visual_learner": visual_learner.state_dict(),
                 "pq_learner": pq_learner.state_dict(),
+                # 保存植入在基座里的 Adapter 权重
+                "internal_adapters": internal_adapters_sd,
             }
-            if controlnet is not None:
-                save_state["controlnet"] = controlnet.state_dict()
             torch.save(save_state, ckp_path)
 
 
@@ -282,7 +299,8 @@ if __name__ == '__main__':
     parser.add_argument("--n_ctx", type=int, default=12, help="the textual prompt length of textual learner")
     parser.add_argument("--features_list", type=int, nargs="+", default=[6, 12, 18, 24], help="features used")
     parser.add_argument("--epoch", type=int, default=15, help="epochs")
-    parser.add_argument("--learning_rate", type=float, default=0.001, help="learning rate")
+    # 注意：这里的学习率已经调小，以适配微调，防止零初始化被瞬间打破
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate")
     parser.add_argument("--batch_size", type=int, default=8, help="batch size")
     parser.add_argument("--image_size", type=int, default=518, help="image size")
     parser.add_argument("--print_freq", type=int, default=1, help="print frequency")
@@ -295,12 +313,9 @@ if __name__ == '__main__':
     parser.add_argument("--vl_reduction", type=int, default=4, help="the reduction number of visual learner")
     parser.add_argument("--pq_mid_dim", type=int, default=128, help="the number of the first hidden layer in pqadapter")
     parser.add_argument("--pq_context", action="store_true", help="Enable context feature")
-    parser.add_argument("--enable_controlnet", action="store_true", help="Enable ControlNet")
-    parser.add_argument("--controlnet_only", action="store_true", help="Only train ControlNet (freeze other adapters)")
-    parser.add_argument("--control_hint_source", type=str, default="gt", choices=["gt", "image"],
-                        help="Control hint source")
-    parser.add_argument("--control_hint_channels", type=int, default=1, help="Control hint channels")
-    parser.add_argument("--control_scales", type=float, nargs="+", default=[1.0], help="ControlNet scales")
+
+    # === 新增超参数：特征蒸馏的权重系数 ===
+    parser.add_argument("--lambda_kd", type=float, default=1.0, help="Weight for Knowledge Distillation loss")
 
     args = parser.parse_args()
     setup_seed(args.seed)

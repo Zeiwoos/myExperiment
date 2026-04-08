@@ -13,6 +13,10 @@ device=0
 retry_wait_seconds=300  # 显存不足后等待时间（秒），默认5分钟
 max_retries=3           # 每个配置的最大重试次数
 
+# 显存监听配置
+gpu_check_interval_seconds=300  # 每5分钟检测一次显存
+min_free_memory_gb=50           # 剩余显存达到该值(GB)后启动测试
+
 # 测试配置列表（每个配置是一个关联数组）
 # 格式: train_dataset:test_dataset:enable_visualize:description
 
@@ -21,8 +25,9 @@ declare -a test_configs=(
     # "hxzy_v4_train_nosongdong_half_plus:hxzy_v4_test:false:1:nosongdong_half_plus"
 
     # "hxzy_v4_train_1shot_half:hxzy_v4_test:false:1:1shot_half"
-    "hxzy_v4_train_1shot_half:hxzy_v4_test:false:4:1shot_half_4"
-
+    "hxzy_v4_train_nongsongdong_half_controlnet_kd09:hxzy_v4_test:false:1:new_1shot_kd0.9"
+    "hxzy_v4_train_nongsongdong_half_controlnet_kd08:hxzy_v4_test:false:1:new_1shot_kd0.8"
+    "hxzy_v4_train_nongsongdong_half_controlnet_kd05:hxzy_v4_test:false:1:new_1shot_kd0.5"
     # "hxzy_v4_train_1shot_nosongdong_half:hxzy_v4_test:false:1:1shot_nosongdong_half"
     # "hxzy_v4_train_1shot_nosongdong_half:hxzy_v4_test:false:4:1shot_nosongdong_half_4"
 
@@ -45,6 +50,67 @@ pq_mid_dim=128
 f1_thresholds=(0.2 0.15 0.1)
 
 # ==================== 辅助函数 ====================
+
+# 解析指定GPU显存信息，输出: used_mb total_mb free_mb
+get_gpu_memory_info_mb() {
+    local gpu_index="$1"
+    local mem_info
+    mem_info=$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits -i "$gpu_index" 2>/dev/null | head -n 1)
+
+    if [ -z "$mem_info" ]; then
+        return 1
+    fi
+
+    # 形如: "94000, 96000"
+    local used_mb total_mb
+    used_mb=$(echo "$mem_info" | awk -F',' '{gsub(/ /,"",$1); print $1}')
+    total_mb=$(echo "$mem_info" | awk -F',' '{gsub(/ /,"",$2); print $2}')
+
+    if ! [[ "$used_mb" =~ ^[0-9]+$ ]] || ! [[ "$total_mb" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+
+    local free_mb=$((total_mb - used_mb))
+    echo "$used_mb $total_mb $free_mb"
+    return 0
+}
+
+# 等待显存满足条件（剩余显存 >= min_free_memory_gb）后再启动后续测试
+wait_for_gpu_memory_ready() {
+    local gpu_index="$1"
+    local min_free_gb="$2"
+    local check_interval="$3"
+
+    echo "开始监听 GPU${gpu_index} 显存（每 ${check_interval}s 检测一次）..."
+    echo "触发条件: 剩余显存 >= ${min_free_gb}G"
+
+    while true; do
+        local mem_triplet
+        if ! mem_triplet=$(get_gpu_memory_info_mb "$gpu_index"); then
+            echo "警告: 无法获取 GPU${gpu_index} 显存信息，${check_interval}s 后重试..."
+            sleep "$check_interval"
+            continue
+        fi
+
+        local used_mb total_mb free_mb
+        read -r used_mb total_mb free_mb <<< "$mem_triplet"
+
+        local used_gb total_gb free_gb
+        used_gb=$((used_mb / 1024))
+        total_gb=$((total_mb / 1024))
+        free_gb=$((free_mb / 1024))
+
+        echo "GPU${gpu_index} 显存占用: ${used_gb}G/${total_gb}G，剩余: ${free_gb}G"
+
+        if [ "$free_gb" -ge "$min_free_gb" ]; then
+            echo "检测到 GPU${gpu_index} 剩余显存 ${free_gb}G >= ${min_free_gb}G，停止监听并启动测试。"
+            break
+        fi
+
+        echo "显存不足，${check_interval}s 后继续检测..."
+        sleep "$check_interval"
+    done
+}
 
 # 检查是否为显存不足错误
 is_oom_error() {
@@ -79,7 +145,7 @@ run_single_test() {
     local description="$5"
     local config_index="$6"
     local total_configs="$7"
-    
+
     echo ""
     echo "=========================================="
     echo "[$config_index/$total_configs] 运行配置: $description"
@@ -88,15 +154,15 @@ run_single_test() {
     echo "  enable_visualize: $enable_visualize"
     echo "  k_shots: $k_shots"
     echo "=========================================="
-    
+
     # 创建临时脚本文件
     local temp_script=$(mktemp)
     local log_file="auto_test_${description}_$(date +%Y%m%d_%H%M%S).log"
-    
+
     # 获取项目根目录（在生成脚本时确定，而不是在临时脚本中计算）
     local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local project_root="$(cd "$script_dir/.." && pwd)"
-    
+
     # 生成测试脚本内容
     cat > "$temp_script" <<EOF
 #!/bin/bash
@@ -135,6 +201,10 @@ model_map[hxzy_v4_train_1shot_nosongdong_half_plus]=adapter_checkpoints/train_on
 
 model_map[hxzy_v4_train_4shot_nosongdong_half]=adapter_checkpoints/train_on_hxzy_v4_train_4shot_nosongdong_half_3adapters_batch8_v2/epoch_15.pth
 model_map[hxzy_v4_train_4shot_nosongdong_half_plus]=adapter_checkpoints/train_on_hxzy_v4_train_4shot_nosongdong_half_plus_3adapters_batch8_v2/epoch_15.pth
+model_map[hxzy_v4_train_nongsongdong_half_controlnet]=/home/root123/GYS/fine_tuning_copy/adapter_checkpoints/train_on_nosongdong_half_controlnet/epoch_15.pth       #kd=1
+model_map[hxzy_v4_train_nongsongdong_half_controlnet_kd09]=/home/root123/GYS/fine_tuning_copy/adapter_checkpoints/train_on_hxzy_part1_v3_batch8_k1_kd0.9/epoch_15.pth
+model_map[hxzy_v4_train_nongsongdong_half_controlnet_kd08]=/home/root123/GYS/fine_tuning_copy/adapter_checkpoints/train_on_hxzy_part1_v3_batch8_k1_kd0.8/epoch_15.pth
+model_map[hxzy_v4_train_nongsongdong_half_controlnet_kd05]=/home/root123/GYS/fine_tuning_copy/adapter_checkpoints/train_on_hxzy_part1_v3_batch8_k1_kd0.5/epoch_15.pth
 
 # 其他配置
 n_ctx=${n_ctx}
@@ -244,11 +314,11 @@ echo "测试完成！结果保存在: \${save_dir}"
 EOF
 
     chmod +x "$temp_script"
-    
+
     # 运行测试，带重试机制
     local retry_count=0
     local success=false
-    
+
     while [ $retry_count -lt $max_retries ]; do
         echo ""
         if [ $retry_count -eq 0 ]; then
@@ -258,6 +328,9 @@ EOF
             sleep $retry_wait_seconds
             echo "继续运行..."
         fi
+
+        # 在每次真正启动测试前，先等待指定 GPU 的剩余显存达到阈值
+        wait_for_gpu_memory_ready "$device" "$min_free_memory_gb" "$gpu_check_interval_seconds"
         
         # 运行测试并捕获输出
         bash "$temp_script" 2>&1 | tee "$log_file"
